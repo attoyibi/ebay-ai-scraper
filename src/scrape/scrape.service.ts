@@ -1,5 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import { chromium, Page, BrowserContext } from 'playwright';
+import OpenAI from 'openai';
+
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY || '',
+});
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5-mini'; // gpt-4o-mini, gpt-3.5-turbo, etc.
 
 async function gotoWithRetry(page: Page, url: string, maxRetries = 3) {
     for (let i = 1; i <= maxRetries; i++) {
@@ -14,7 +20,6 @@ async function gotoWithRetry(page: Page, url: string, maxRetries = 3) {
         }
     }
 }
-
 async function logDescriptionHTML(context: BrowserContext, link: string) {
     console.log(`\n[DESC HTML] masuk logDescriptionHTML -> ${link}`);
     const page = await context.newPage();
@@ -69,6 +74,13 @@ async function logDescriptionHTML(context: BrowserContext, link: string) {
                 const html = await loc.innerHTML().catch(() => '');
                 if (html) {
                     console.log(`\n[DESC HTML] selector: ${sel}\n`, html);
+                    const clean = htmlToCleanText(html, 3500);
+                    console.log(`\n[DESC CLEAN] selector: ${sel}\n`, clean);
+
+                    const pageTitle = await page.title().catch(() => '');
+                    const summary = await summarizeWithOpenAI(pageTitle, clean);
+                    console.log(`\n[DESC SUMMARY] ${summary}`);
+
                     printed = true;
                 }
             }
@@ -79,8 +91,15 @@ async function logDescriptionHTML(context: BrowserContext, link: string) {
         for (const frame of frames) {
             if (/desc/i.test(frame.url())) {
                 try {
-                    const html = await frame.content(); // safe meski cross-origin (ambil markup)
+                    const html = await frame.content();
                     console.log(`\n[DESC HTML - iframe: ${frame.url()}]\n`, html);
+                    const clean = htmlToCleanText(html, 3500);
+                    console.log(`\n[DESC CLEAN - iframe]\n`, clean);
+
+                    const pageTitle = await page.title().catch(() => '');
+                    const summary = await summarizeWithOpenAI(pageTitle, clean);
+                    console.log(`\n[DESC SUMMARY] ${summary}`);
+
                     printed = true;
                 } catch { }
             }
@@ -99,6 +118,63 @@ async function logDescriptionHTML(context: BrowserContext, link: string) {
         await page.close().catch(() => { });
     }
 }
+function htmlToCleanText(html: string, limit = 3500): string {
+    if (!html) return '-';
+
+    // buang elemen yang tidak perlu
+    html = html
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/<noscript[\s\S]*?<\/noscript>/gi, '');
+
+    // ubah beberapa tag ke newline agar tetap terbaca
+    html = html
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/(p|li|div|section|tr|h[1-6]|article)>/gi, '\n');
+
+    // ambil teks
+    let text = html.replace(/<[^>]+>/g, ' ');
+
+    // rapikan spasi & baris
+    text = text
+        .replace(/\u00a0/g, ' ')
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+
+    // buang boilerplate yang umum tidak relevan
+    const BAD = /(seller assumes|report item|returns|refund|shipping|payment|powered by|ebay money back guarantee)/i;
+    text = text
+        .split('\n')
+        .map(s => s.trim())
+        .filter(s => s && !BAD.test(s))
+        .join('\n');
+
+    // batasi panjang supaya hemat (kalau nanti ke AI)
+    if (text.length > limit) text = text.slice(0, limit) + '…';
+
+    return text || '-';
+}
+
+async function summarizeWithOpenAI(title: string, cleanText: string): Promise<string> {
+    if (!cleanText || cleanText === '-') return '-';
+    try {
+        const trimmed = cleanText.length > 3500 ? cleanText.slice(0, 3500) + '…' : cleanText;
+        const resp = await openai.responses.create({
+            model: OPENAI_MODEL, // misal 'gpt-4o-mini'
+            instructions:
+                'Ringkas deskripsi produk e-commerce secara objektif (Bahasa Indonesia), maksimal 2 kalimat. Jangan ada promosi.',
+            input: `Judul: ${title}\nTeks:\n${trimmed}\n\nRingkas jadi 1–2 kalimat.`,
+            max_output_tokens: 160,
+            temperature: 0.2,
+        });
+        return (resp as any).output_text?.trim?.() || '-';
+    } catch (err) {
+        console.warn('[AI] summarize error:', err);
+        return '-';
+    }
+}
+
 
 
 @Injectable()
