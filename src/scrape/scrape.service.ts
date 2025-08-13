@@ -2,6 +2,8 @@ import { Injectable } from '@nestjs/common';
 import { chromium, Page, BrowserContext } from 'playwright';
 import OpenAI from 'openai';
 
+
+
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY || '',
 });
@@ -20,15 +22,19 @@ async function gotoWithRetry(page: Page, url: string, maxRetries = 3) {
         }
     }
 }
-async function logDescriptionHTML(context: BrowserContext, link: string) {
+async function logDescriptionHTML(context: BrowserContext, link: string, options?: { summarize?: boolean }) {
     console.log(`\n[DESC HTML] masuk logDescriptionHTML -> ${link}`);
     const page = await context.newPage();
+
+    let finalClean = '-';
+    let finalSummary = '-';
+
     try {
         await gotoWithRetry(page, link, 3);
         await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => { });
         console.log('[DESC HTML] landed at:', page.url());
 
-        // klik consent kalau ada (detail page kadang muncul lagi)
+        // klik consent
         try {
             const accept = page.getByRole('button', { name: /accept|agree|ok/i }).first();
             if (await accept.count()) {
@@ -59,65 +65,61 @@ async function logDescriptionHTML(context: BrowserContext, link: string) {
             '#desc_div',
             '.item-desc'
         ];
-        const DESC_JOIN = DESC_SELECTORS.join(',');
 
-        // Tunggu salah satu selector ATAU iframe deskripsi muncul
-        const foundMain = await page.waitForSelector(DESC_JOIN, { timeout: 5000 }).catch(() => null);
-        const foundIframe = await page.waitForSelector('iframe#desc_ifr, iframe[src*="desc"], iframe[title*="Description"]', { timeout: 6000 }).catch(() => null);
+        let found = false;
 
-        let printed = false;
-
-        // Ambil dari DOM utama (jika ada)
+        // Ambil dari DOM utama
         for (const sel of DESC_SELECTORS) {
             const loc = page.locator(sel).first();
             if (await loc.count().catch(() => 0)) {
                 const html = await loc.innerHTML().catch(() => '');
+                console.log(`[DESC HTML] checking selector: ${sel} (${html.length} chars)`);
+                console.log(`[DESC HTML] print selector: ${sel} (${html} chars)`);
                 if (html) {
-                    console.log(`\n[DESC HTML] selector: ${sel}\n`, html);
                     const clean = htmlToCleanText(html, 3500);
-                    console.log(`\n[DESC CLEAN] selector: ${sel}\n`, clean);
-
+                    console.log(`[DESC HTML] found in DOM: ${sel} (${clean.length} chars)`);
                     const pageTitle = await page.title().catch(() => '');
-                    const summary = await summarizeWithOpenAI(pageTitle, clean);
-                    console.log(`\n[DESC SUMMARY] ${summary}`);
+                    const doSummarize = options?.summarize ?? true; // default: true
+                    const summary = doSummarize ? await summarizeWithOpenAI(pageTitle, clean) : '-';
 
-                    printed = true;
+                    finalClean = clean;
+                    finalSummary = summary;
+                    console.log(`[DESC HTML] found in DOM: ${sel}`);
+                    found = true;
+                    break;
                 }
             }
         }
 
-        // Fallback iframe (sering dipakai eBay)
-        const frames = page.frames();
-        for (const frame of frames) {
-            if (/desc/i.test(frame.url())) {
-                try {
-                    const html = await frame.content();
-                    console.log(`\n[DESC HTML - iframe: ${frame.url()}]\n`, html);
-                    const clean = htmlToCleanText(html, 3500);
-                    console.log(`\n[DESC CLEAN - iframe]\n`, clean);
+        // Fallback iframe
+        if (!found) {
+            for (const frame of page.frames()) {
+                if (/desc/i.test(frame.url())) {
+                    try {
+                        const html = await frame.content();
+                        const clean = htmlToCleanText(html, 3500);
+                        const pageTitle = await page.title().catch(() => '');
+                        const summary = await summarizeWithOpenAI(pageTitle, clean);
 
-                    const pageTitle = await page.title().catch(() => '');
-                    const summary = await summarizeWithOpenAI(pageTitle, clean);
-                    console.log(`\n[DESC SUMMARY] ${summary}`);
-
-                    printed = true;
-                } catch { }
+                        finalClean = clean;
+                        finalSummary = summary;
+                        found = true;
+                        break;
+                    } catch { }
+                }
             }
         }
-
-        if (!printed) {
-            console.log('[DESC HTML] no description selectors/iframe matched.');
-            // Debug cepat: panjang content body
-            const contentLen = (await page.content()).length;
-            console.log('[DESC HTML] page.content length:', contentLen);
-        }
+        console.log(`[DESC HTML] finalClean: ${finalClean.length} chars, finalSummary: ${finalSummary.length} chars`);
+        return { clean: finalClean, summary: finalSummary };
 
     } catch (err) {
         console.error('Error getting description HTML:', err);
+        return { clean: '-', summary: '-' };
     } finally {
         await page.close().catch(() => { });
     }
 }
+
 function htmlToCleanText(html: string, limit = 3500): string {
     if (!html) return '-';
 
@@ -163,8 +165,8 @@ async function summarizeWithOpenAI(title: string, cleanText: string): Promise<st
         const resp = await openai.responses.create({
             model: OPENAI_MODEL, // misal 'gpt-4o-mini'
             instructions:
-                'Ringkas deskripsi produk e-commerce secara objektif (Bahasa Indonesia), maksimal 2 kalimat. Jangan ada promosi.',
-            input: `Judul: ${title}\nTeks:\n${trimmed}\n\nRingkas jadi 1–2 kalimat.`,
+                'Summarize the e-commerce product description objectively in English. Use at most 2 sentences. Do not include promotional language.',
+            input: `Title: ${title}\nText:\n${trimmed}\n\nSummarize in 1–2 sentences.`,
             max_output_tokens: 160,
             temperature: 0.2,
         });
@@ -183,11 +185,10 @@ export class ScrapeService {
         const primary = process.env.EBAY_DOMAIN || 'www.ebay.com';
         const fallback = process.env.EBAY_ALT_DOMAIN || 'www.ebay.co.uk';
 
-        // ⬇️ now accepts page number
         const makeUrl = (domain: string, p: number = 1) =>
             `https://${domain}/sch/i.html?_nkw=${encodeURIComponent(keyword)}&_pgn=${p}`;
 
-        const browser = await chromium.launch({ headless: false, slowMo: 200 });
+        const browser = await chromium.launch({ headless: true, slowMo: 200 });
         const context = await browser.newContext({
             userAgent:
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
@@ -290,8 +291,19 @@ export class ScrapeService {
                     link: new URL(it.href, pageUrl).href,
                 }));
 
-                allItems.push(...items);
+                // Hanya N item pertama yang di-summary AI. Sisanya clean-only.
+                const SUMMARY_LIMIT = 5; // cuma N item yang disummary AI
+                const MAX_ITEMS = items.length;     // batasi loop sampai N item
 
+                for (let i = 0; i < Math.min(items.length, MAX_ITEMS); i++) {
+                    const doSummarize = i < SUMMARY_LIMIT;
+                    const desc = await logDescriptionHTML(context, items[i].link, { summarize: doSummarize });
+                    (items[i] as any).descriptionClean = desc.clean;
+                    (items[i] as any).descriptionSummary = desc.summary;
+                }
+
+                console.log(items.slice(0, MAX_ITEMS)); // tampilkan langsung di console
+                allItems.push(...items.slice(0, MAX_ITEMS));
                 // throttle antar halaman
                 await page.waitForTimeout(500 + Math.floor(Math.random() * 500));
             }
@@ -299,14 +311,15 @@ export class ScrapeService {
             console.log(`[SCRAPER] total items: ${allItems.length}`);
 
             // Coba ambil deskripsi untuk item pertama (atau loop semua)
-            if (allItems.length > 0) {
-                await logDescriptionHTML(context, allItems[30].link);
-                console.log('[DEBUG] will open detail:', allItems[30].link);
-            }
+            // if (allItems.length > 0) {
+            //     await logDescriptionHTML(context, allItems[30].link);
+            //     console.log('[DEBUG] will open detail:', allItems[30].link);
+            // }
             return {
                 ok: true,
                 message: `Opened eBay OK for "${keyword}"`,
                 url: urlTried,
+                count: allItems.length,
                 items: allItems,
             };
         } catch (error) {
