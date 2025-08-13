@@ -2,8 +2,6 @@ import { Injectable } from '@nestjs/common';
 import { chromium, Page, BrowserContext } from 'playwright';
 import OpenAI from 'openai';
 
-
-
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY || '',
 });
